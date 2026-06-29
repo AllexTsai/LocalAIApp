@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 修正大小寫：僅 W 大寫 -->
+    <UseWpf>true</UseWpf> 
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 維持您原有的核心套件 -->
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.77.0" />
+    <!-- 補上 Ollama 專屬連接器，版本與核心保持一致 -->
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.Ollama" Version="1.77.0-alpha" />
+  </ItemGroup>
+
+</Project>

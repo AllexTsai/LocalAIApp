@@ -1,0 +1,29 @@
+﻿<Window x:Class="LocalAIApp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="地端 AI 顯示器校色助手" Height="450" Width="600">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="地端 AI 助手 (使用 Phi-3 模型)" FontSize="18" FontWeight="Bold" Margin="0,0,0,10"/>
+        
+        <!-- 顯示 AI 回覆的文字框 -->
+        <TextBox x:Name="TxtResponse" Grid.Row="1" TextWrapping="Wrap" IsReadOnly="True" 
+                 VerticalScrollBarVisibility="Auto" Margin="0,0,0,10" Background="#F5F5F5" Padding="10"/>
+
+        <!-- 使用者輸入與送出按鈕 -->
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="TxtInput" Grid.Column="0" Height="40" Padding="5" VerticalContentAlignment="Center" FontSize="14"
+                     KeyDown="TxtInput_KeyDown"/>
+            <Button x:Name="BtnSend" Grid.Column="1" Content="送出" Width="80" Margin="10,0,0,0" Click="BtnSend_Click"/>
+        </Grid>
+    </Grid>
+</Window>
