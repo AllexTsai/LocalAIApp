@@ -11,7 +11,7 @@
 
         <TextBlock Text="地端 AI 助手 (使用 Phi-3 模型)" FontSize="18" FontWeight="Bold" Margin="0,0,0,10"/>
         
-        <!-- 顯示 AI 回覆的文字框 -->
+        <!-- Displaying the AI's reply. -->
         <TextBox x:Name="TxtResponse" Grid.Row="1" TextWrapping="Wrap" IsReadOnly="True" 
                  VerticalScrollBarVisibility="Auto" Margin="0,0,0,10" Background="#F5F5F5" Padding="10"/>
         <Border x:Name="LoadingOverlay"
@@ -21,19 +21,19 @@
                 Margin="0,0,0,10">
             <StackPanel HorizontalAlignment="Center"
                     VerticalAlignment="Center">
-                <!-- 這裡可以放轉圈圈的 GIF，或是先用簡單的文字加點點動畫 -->
+                <!-- In the future, we can upload GIFs of spinning circles, or simple text with dotted animations. -->
                 <TextBlock Text="AI 正在思考中，請稍候..."
                            FontSize="16"
                            FontWeight="Bold"
                            Foreground="#FF333333"/>
-                <!-- 額外加一個簡易進度條，增強視覺感 -->
+                <!-- Simple progress bar -->
                 <ProgressBar IsIndeterminate="True"
                         Width="150"
                         Height="4"
                         Margin="0,10,0,0"/>
             </StackPanel>
         </Border>
-        <!-- 使用者輸入與送出按鈕 -->
+        <!-- User input and send buttons -->
         <Grid Grid.Row="2">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>

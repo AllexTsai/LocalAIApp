@@ -42,7 +42,7 @@ public partial class MainWindow : Window
         string userInput = TxtInput.Text.Trim();
         if (string.IsNullOrEmpty(userInput)) return;
 
-        // 如果上一次的對話還在跑，先取消掉它
+        // If the previous conversation is still running, cancel it first.
         _cts?.Cancel();
         _cts = new CancellationTokenSource();
 
@@ -70,7 +70,7 @@ public partial class MainWindow : Window
                 Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
             };
 
-            // 💡 將 CancellationToken 注入到網路請求中
+            // Inject the CancellationToken into the network request
             using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, _cts.Token);
             response.EnsureSuccessStatusCode();
 
@@ -79,7 +79,8 @@ public partial class MainWindow : Window
             
             string fullResponseText = "";
 
-            // 💡 在讀取串流的每一行時，同樣傳入 Token。一旦取消，這裡會立刻噴出 OperationCanceledException 並終止
+            // The same Token is passed in when reading each line of the stream.
+            // If cancelled, an OperationCanceledException will be thrown immediately, terminating the process.
             while (await reader.ReadLineAsync(_cts.Token) is string line)
             {
                 if (string.IsNullOrEmpty(line)) continue;
@@ -91,7 +92,7 @@ public partial class MainWindow : Window
                     if (isFirstToken && !string.IsNullOrEmpty(token))
                     {
                         isFirstToken = false;
-                        // 關閉思考中動畫，讓使用者看到畫面開始動了
+                        // Turn off the animation so that the user can see the screen start moving.
                         LoadingOverlay.Visibility = Visibility.Collapsed;
                     }
 
@@ -102,12 +103,12 @@ public partial class MainWindow : Window
                 }
                 if (jsonDoc.RootElement.TryGetProperty("done", out var doneProp) && doneProp.GetBoolean())
                 {
-                    // 檢查結束時的狀態統計
+                    // Status statistics at the end of the inspection
                     if (jsonDoc.RootElement.TryGetProperty("done_reason", out var reason))
                     {
                         string endReason = reason.GetString()?? "";
-                        // 如果 endReason 是 "length"，代表就是 num_predict 不夠大，被強制切斷了！
-                        // 如果 endReason 是 "stop"，代表模型自己覺得講完了（可能是 prompt 引導不夠好）
+                        // If endReason is "length", it means that num_predict is not large enough and has been forcibly truncated!
+                        // If endReason is "stop", it means the model itself feels it has finished explaining (possibly due to insufficient prompt guidance).
                         Console.WriteLine($"Stream 結束原因: {endReason}");
                     }
                 }
@@ -115,7 +116,7 @@ public partial class MainWindow : Window
         }
         catch (OperationCanceledException)
         {
-            // 使用者取消或視窗關閉，優雅結束，不噴錯誤 UI
+            // The user cancels or closes the window, ending without the UI errors.
             System.Diagnostics.Debug.WriteLine("AI 推論已被使用者或系統安全取消。");
         }
         catch (Exception ex)
@@ -129,17 +130,16 @@ public partial class MainWindow : Window
         }
     }
 
-    // 💡 當使用者點擊視窗「X」關閉時觸發
     private void MainWindow_Closed(object? sender, EventArgs e)
     {
-        // 1. 發出取消訊號，強行中斷正在背景狂奔的 HttpClient 串流
+        // 1. Send a cancellation signal to forcibly interrupt the HttpClient stream that is running in the background.
         _cts?.Cancel();
         _cts?.Dispose();
 
-        // 2. 徹底釋放 HttpClient
+        // 2. Completely release HttpClient
         _httpClient.Dispose();
 
-        // 3. 強制確保整個 WPF 進程完全退出，不留孤兒程序
+        // 3. Forcefully ensures the entire WPF process exits completely.
         Application.Current.Shutdown();
     }
 }
