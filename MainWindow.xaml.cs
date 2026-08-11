@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Windows;
 using System.Windows.Input;
+using LocalAIApp.Services; 
 
 namespace LocalAIApp;
 
@@ -15,6 +16,8 @@ public partial class MainWindow : Window
     private const string OllamaUrl = "http://localhost:11434/api/generate";
     
     private CancellationTokenSource? _cts;
+
+    private readonly IAiSecurityPipeline _securityPipeline = new AiSecurityPipeline();
 
     public MainWindow()
     {
@@ -42,6 +45,28 @@ public partial class MainWindow : Window
         string userInput = TxtInput.Text.Trim();
         if (string.IsNullOrEmpty(userInput)) return;
 
+        string sanitizedInput = _securityPipeline.SanitizePrompt(userInput);
+
+        // Define your System settings and final assembly Prompt template
+        string systemSetting = "[系統設定]你是一位精通顯示器色彩校正的架構師。請用繁體中文回答。";
+        string finalPrompt = $"{systemSetting}\n[使用者提問]{sanitizedInput}";
+
+        // My laptop's tested security context boundaries
+        const int LaptopMaxCtx = 1024; 
+
+        // Pre-estimation is performed using systemSetting and the cleaned sanitizedInput.
+        if (!_securityPipeline.ValidateTokenBudget(systemSetting, sanitizedInput, LaptopMaxCtx, out int projectedTokens))
+        {
+            // Triggering security defense: Instead of uploading to the local Ollama server, a warning is displayed directly in the UI to protect the laptop's CPU from overheating.
+            TxtResponse.Text = $"⚠️【地端算力防禦熔斷】\n" +
+                               $"當前輸入預估消耗 {projectedTokens} Tokens（已逼近或超越硬體安全負載上限 {LaptopMaxCtx}）。\n" +
+                               $"為防止作業系統 Thread Pool 過載與核心風扇暴走，本次推理已自動攔截。\n" +
+                               $"[建議] 請縮短您的提問內容，或精簡前置文字後重新發送。";
+            
+            // Keep the input box content intact so users can easily edit and reduce the number of characters.
+            return; 
+        }
+
         // If the previous conversation is still running, cancel it first.
         _cts?.Cancel();
         _cts = new CancellationTokenSource();
@@ -58,7 +83,7 @@ public partial class MainWindow : Window
             model = "phi3",
             prompt = $"[系統設定]你是一位精通顯示器色彩校正的架構師。請用繁體中文回答。\n[使用者提問]{userInput}",
             stream = true,
-            options = new { num_predict = 1024, temperature = 0.3 , num_ctx = 1024}
+            options = new { num_predict = 1024, temperature = 0.3 , num_ctx = LaptopMaxCtx}
         };
 
         try

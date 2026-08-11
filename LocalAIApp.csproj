@@ -14,6 +14,7 @@
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.77.0" />
     <!-- 補上 Ollama 專屬連接器，版本與核心保持一致 -->
     <PackageReference Include="Microsoft.SemanticKernel.Connectors.Ollama" Version="1.77.0-alpha" />
+    <PackageReference Include="SharpToken" Version="2.0.6" />
   </ItemGroup>
 
 </Project>
