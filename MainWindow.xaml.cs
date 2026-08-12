@@ -6,7 +6,8 @@ using System.Text.Json;
 using System.Threading;
 using System.Windows;
 using System.Windows.Input;
-using LocalAIApp.Services; 
+using LocalAIApp.Services;
+using LocalAIApp.Tools;
 
 namespace LocalAIApp;
 
@@ -14,7 +15,7 @@ public partial class MainWindow : Window
 {
     private readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromMinutes(5) };
     private const string OllamaUrl = "http://localhost:11434/api/generate";
-    
+
     private CancellationTokenSource? _cts;
 
     private readonly IAiSecurityPipeline _securityPipeline = new AiSecurityPipeline();
@@ -23,7 +24,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         TxtResponse.Text = "地端 AI 原生防禦版就緒！";
-        
+
         this.Closed += MainWindow_Closed;
     }
 
@@ -45,29 +46,35 @@ public partial class MainWindow : Window
         string userInput = TxtInput.Text.Trim();
         if (string.IsNullOrEmpty(userInput)) return;
 
+        // Clean Prompt
         string sanitizedInput = _securityPipeline.SanitizePrompt(userInput);
 
-        // Define your System settings and final assembly Prompt template
-        string systemSetting = "[系統設定]你是一位精通顯示器色彩校正的架構師。請用繁體中文回答。";
-        string finalPrompt = $"{systemSetting}\n[使用者提問]{sanitizedInput}";
+        // By employing strict intent separation and strong paradigms, the reflection range of the small model is confined.
+        string systemSetting =
+            "你是一位精通 Windows 系統與顯示器色彩校正的專業架構師。請用繁體中文回答。\n\n" +
+            "[核心規則]\n" +
+            "1. 當使用者是在跟你「討論技術概念」、「比較平台差異」(例如問Windows與Mac色彩差異) 或「一般聊天」時，你「禁止」輸出任何協議標籤，請直接用文字專業回覆。\n" +
+            "2. 只有當使用者發出明確的「查詢指令」或希望「即時偵測/診斷/獲取當前這台電腦的實體硬體數據」時，你才可以在回覆的最開頭輸出以下標籤（其後不加其他文字）：\n" +
+            "   - 明確要求查這台電腦的作業系統版本: [[CALL_WMI:OS]]\n" +
+            "   - 明確要求查這台電腦的CPU資訊/負載: [[CALL_WMI:CPU]]\n" +
+            "   - 明確要求查這台電腦的顯示卡/GPU: [[CALL_WMI:GPU]]\n" +
+            "   - 明確要求查這台電腦的記憶體/RAM: [[CALL_WMI:Memory]]\n" +
+            "   - 明確要求查這台電腦的硬碟/Disk: [[CALL_WMI:Disk]]\n\n" +
+            "[範例對齊]\n" +
+            "問：「Windows色彩架構跟Mac有何不同？」 -> 答：「(直接詳細解釋ICC Profile與色彩管理差異，絕對不帶有標籤)」\n" +
+            "問：「幫我看一下我這台電腦的CPU是哪一顆」 -> 答：「[[CALL_WMI:CPU]]」";
 
-        // My laptop's tested security context boundaries
-        const int LaptopMaxCtx = 1024; 
+        string finalPrompt = $"<|system|>\n{systemSetting}<|end|>\n<|user|>\n{sanitizedInput}<|end|>\n<|assistant|>\n";
 
-        // Pre-estimation is performed using systemSetting and the cleaned sanitizedInput.
+        const int LaptopMaxCtx = 2048;
+
+        // Token computing power circuit breaker check
         if (!_securityPipeline.ValidateTokenBudget(systemSetting, sanitizedInput, LaptopMaxCtx, out int projectedTokens))
         {
-            // Triggering security defense: Instead of uploading to the local Ollama server, a warning is displayed directly in the UI to protect the laptop's CPU from overheating.
-            TxtResponse.Text = $"⚠️【地端算力防禦熔斷】\n" +
-                               $"當前輸入預估消耗 {projectedTokens} Tokens（已逼近或超越硬體安全負載上限 {LaptopMaxCtx}）。\n" +
-                               $"為防止作業系統 Thread Pool 過載與核心風扇暴走，本次推理已自動攔截。\n" +
-                               $"[建議] 請縮短您的提問內容，或精簡前置文字後重新發送。";
-            
-            // Keep the input box content intact so users can easily edit and reduce the number of characters.
-            return; 
+            TxtResponse.Text = $"⚠️【地端算力防禦熔斷】\n當前輸入預估消耗 {projectedTokens} Tokens（已超越硬體負載上限 {LaptopMaxCtx}）。本次推理已安全攔截。";
+            return;
         }
 
-        // If the previous conversation is still running, cancel it first.
         _cts?.Cancel();
         _cts = new CancellationTokenSource();
 
@@ -81,67 +88,89 @@ public partial class MainWindow : Window
         var requestPayload = new
         {
             model = "phi3",
-            prompt = $"[系統設定]你是一位精通顯示器色彩校正的架構師。請用繁體中文回答。\n[使用者提問]{userInput}",
+            prompt = finalPrompt,
             stream = true,
-            options = new { num_predict = 1024, temperature = 0.3 , num_ctx = LaptopMaxCtx}
+            options = new { num_predict = 512, temperature = 0.0, num_ctx = LaptopMaxCtx }
         };
 
         try
         {
             var jsonPayload = JsonSerializer.Serialize(requestPayload);
-            
+
             using var request = new HttpRequestMessage(HttpMethod.Post, OllamaUrl)
             {
                 Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
             };
 
-            // Inject the CancellationToken into the network request
             using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, _cts.Token);
             response.EnsureSuccessStatusCode();
 
             using var stream = await response.Content.ReadAsStreamAsync(_cts.Token);
             using var reader = new StreamReader(stream, Encoding.UTF8);
-            
-            string fullResponseText = "";
 
-            // The same Token is passed in when reading each line of the stream.
-            // If cancelled, an OperationCanceledException will be thrown immediately, terminating the process.
+            string fullResponseText = "";
+            bool isProtocolChecked = false;
+
             while (await reader.ReadLineAsync(_cts.Token) is string line)
             {
                 if (string.IsNullOrEmpty(line)) continue;
 
                 using var jsonDoc = JsonDocument.Parse(line);
-                if (jsonDoc.RootElement.TryGetProperty("response", out var responseProp))
+                var root = jsonDoc.RootElement;
+
+                if (root.TryGetProperty("response", out var responseProp))
                 {
                     string token = responseProp.GetString() ?? "";
                     if (isFirstToken && !string.IsNullOrEmpty(token))
                     {
                         isFirstToken = false;
-                        // Turn off the animation so that the user can see the screen start moving.
                         LoadingOverlay.Visibility = Visibility.Collapsed;
                     }
 
                     fullResponseText += token;
 
-                    TxtResponse.Text = fullResponseText;
-                    TxtResponse.ScrollToEnd();
-                }
-                if (jsonDoc.RootElement.TryGetProperty("done", out var doneProp) && doneProp.GetBoolean())
-                {
-                    // Status statistics at the end of the inspection
-                    if (jsonDoc.RootElement.TryGetProperty("done_reason", out var reason))
+                    // As long as the protocol hasn't been triggered yet, and the stream text contains a complete protocol closing tag. `]]`
+                    if (!isProtocolChecked && fullResponseText.Contains("[[CALL_WMI:") && fullResponseText.Contains("]]"))
                     {
-                        string endReason = reason.GetString()?? "";
-                        // If endReason is "length", it means that num_predict is not large enough and has been forcibly truncated!
-                        // If endReason is "stop", it means the model itself feels it has finished explaining (possibly due to insufficient prompt guidance).
-                        Console.WriteLine($"Stream 結束原因: {endReason}");
+                        isProtocolChecked = true; // The system is locked; subsequent normal conversations will never trigger the check again.
+                        LoadingOverlay.Visibility = Visibility.Collapsed;
+
+                        int startIdx = fullResponseText.IndexOf("[[CALL_WMI:") + 11;
+                        int endIdx = fullResponseText.IndexOf("]]", startIdx);
+
+                        if (endIdx > startIdx)
+                        {
+                            string selectedCategory = fullResponseText.Substring(startIdx, endIdx - startIdx).Trim();
+
+                            TxtResponse.Text = $"🤖 [協議解碼成功] 偵測到模型發射 WMI 驅動標籤：[{selectedCategory}]。\n正在跨進程喚醒 WmiQueryTool 子系統...\n";
+                            TxtResponse.ScrollToEnd();
+
+                            var adapterType = typeof(WmiToolAdapter);
+                            var method = adapterType.GetMethod("ExecuteWmiQuery");
+
+                            if (method != null)
+                            {
+                                var adapterInstance = new WmiToolAdapter();
+                                string wmiResult = (string)method.Invoke(adapterInstance, new object[] { selectedCategory })!;
+
+                                TxtResponse.Text += $"\n====================================\n{wmiResult}====================================\n\n🤖 [系統優化提示] 舊有組件數據已透過 IPC 隔離管道安全回填。";
+                                TxtResponse.ScrollToEnd();
+                            }
+                            break; // The Ollama connection should only be disconnected when the WMI protocol is actually triggered!
+                        }
+                    }
+
+                    // As long as it doesn't start with a protocol tag, it's a pure technical discussion, 100% complete, and will never be interrupted midway.
+                    if (!fullResponseText.StartsWith("[[CALL_WMI:"))
+                    {
+                        TxtResponse.Text = fullResponseText;
+                        TxtResponse.ScrollToEnd();
                     }
                 }
             }
         }
         catch (OperationCanceledException)
         {
-            // The user cancels or closes the window, ending without the UI errors.
             System.Diagnostics.Debug.WriteLine("AI 推論已被使用者或系統安全取消。");
         }
         catch (Exception ex)
@@ -154,6 +183,7 @@ public partial class MainWindow : Window
             BtnSend.IsEnabled = true;
         }
     }
+
 
     private void MainWindow_Closed(object? sender, EventArgs e)
     {
