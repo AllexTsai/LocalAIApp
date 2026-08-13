@@ -41,6 +41,11 @@ public partial class MainWindow : Window
         }
     }
 
+    System.Diagnostics.Stopwatch totalWatch = System.Diagnostics.Stopwatch.StartNew();
+    System.Diagnostics.Stopwatch tokenWatch = new System.Diagnostics.Stopwatch();
+
+    long ttftMilliseconds = 0;
+    int tokenCount = 0;
     private async System.Threading.Tasks.Task SendMessageToAiAsync()
     {
         string userInput = TxtInput.Text.Trim();
@@ -125,8 +130,16 @@ public partial class MainWindow : Window
                     {
                         isFirstToken = false;
                         LoadingOverlay.Visibility = Visibility.Collapsed;
+
+                        // Stop counting when the first character is captured.
+                        totalWatch.Stop();
+                        ttftMilliseconds = totalWatch.ElapsedMilliseconds;
+
+                        // Start the word timer
+                        tokenWatch.Start();
                     }
 
+                    tokenCount++;
                     fullResponseText += token;
 
                     // As long as the protocol hasn't been triggered yet, and the stream text contains a complete protocol closing tag. `]]`
@@ -167,6 +180,27 @@ public partial class MainWindow : Window
                         TxtResponse.ScrollToEnd();
                     }
                 }
+            }
+
+            // After the streaming is completely finished (outside the loop), calculate TPOT and output the performance metrics to the UI or Console.
+            tokenWatch.Stop();
+            double tpotMilliseconds = tokenCount > 0 ? (double)tokenWatch.ElapsedMilliseconds / tokenCount : 0;
+
+            Console.WriteLine($"[AI 效能報告] TTFT (首字延遲): {ttftMilliseconds} ms | TPOT (平均字延遲): {tpotMilliseconds:F2} ms/token | 總生成 Token 數: {tokenCount}");
+
+            if (tokenCount > 0)
+            {
+                TxtResponse.Text += $"\n\n" +
+                                    $"====================================\n" +
+                                    $"📊 【地端 AI 邊緣端效能即時觀測】\n" +
+                                    $"------------------------------------\n" +
+                                    $" ⏱️ 首字延遲 (TTFT)  : {ttftMilliseconds} ms\n" +
+                                    $" ⚡ 每個 Token 延遲   : {tpotMilliseconds:F2} ms/token\n" +
+                                    $" 📈 持續吞吐效能     : {(1000 / tpotMilliseconds):F1} tokens/sec\n" +
+                                    $" 📥 總輸出 Token 數量 : {tokenCount} tokens\n" +
+                                    $"====================================";
+                
+                TxtResponse.ScrollToEnd();
             }
         }
         catch (OperationCanceledException)
