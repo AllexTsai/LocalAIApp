@@ -8,51 +8,43 @@ namespace LocalAIApp.Services
     public interface IAiSecurityPipeline
     {
         string SanitizePrompt(string rawInput);
-        bool ValidateTokenBudget(string systemPrompt, string sanitizedInput, int maxContextWindow, out int totalTokens);
+        bool ValidateTokenBudget(string finalPrompt, int maxContextWindow, out int totalTokens);
     }
 
     public class AiSecurityPipeline : IAiSecurityPipeline
     {
         private readonly GptEncoding _encoder;
 
+        // 校正係數來源：實測 15 筆樣本（短句/長輸入/純中文/純英文/中英夾雜），
+        // 比對 SharpToken(cl100k_base) 估算值 vs Ollama 實際 prompt_eval_count，
+        // 觀測到 actual/estimate 比值穩定落在 1.1930 ~ 1.2140（平均 1.2033，標準差 0.48%）。
+        // 1.22 略高於目前觀測到的最大值，讓熔斷閾值保守，而非取平均值。
+        private const double CalibrationFactor = 1.22;
+
         public AiSecurityPipeline()
         {
-            // cl100k_base is the underlying BPE segmentation code used by gpt-4, gpt-3.5, and most modern open-source small models (such as Phi-3, Llama-3) 
-            // SharpToken has this encoding built-in, requiring no additional loading of any local files, resulting in minimal memory usage
-            _encoder = GptEncoding.GetEncoding("cl100k_base"); 
+            _encoder = GptEncoding.GetEncoding("cl100k_base");
         }
 
-        /// <summary>
-        /// 1. Prompt Cleaning: Defending against Special Character Contamination and Injection
-        /// </summary>
         public string SanitizePrompt(string rawInput)
         {
             if (string.IsNullOrWhiteSpace(rawInput)) return string.Empty;
 
-            // Remove ASCII control characters (0-31), preserve newlines and tabs to prevent Ollama's JSON parsing from crashing.
             string sanitized = Regex.Replace(rawInput, @"[\x00-\x08\x0B\x0C\x0E-\x1F]", "");
-
-            // Prevent users from entering malicious Chat Template tags (such as <|end|> for Llama/Phi).
             sanitized = sanitized.Replace("<|", "&lt;|").Replace("|>", "|&gt;");
 
             return sanitized.Trim();
         }
 
-        /// <summary>
-        /// 2. Token circuit breaker mechanism: providing computational power defense before the token is sent from the ground.
-        /// </summary>
-        public bool ValidateTokenBudget(string systemPrompt, string sanitizedInput, int maxContextWindow, out int totalTokens)
+        // 直接對完整的 finalPrompt（包含 <|system|>、<|end|> 等 chat template 標籤）做 Encode，
+        // 而不是分開估算 systemPrompt 跟使用者輸入再相加，避免漏算標籤本身消耗的 token。
+        public bool ValidateTokenBudget(string finalPrompt, int maxContextWindow, out int totalTokens)
         {
-            // Use SharpToken's Encode for precise counting
-            var systemTokensCount = _encoder.Encode(systemPrompt).Count;
-            var userTokensCount = _encoder.Encode(sanitizedInput).Count;
-
-            // Buffer reserved for model response (512 tokens reserved for model output)
+            int rawEstimate = _encoder.Encode(finalPrompt).Count;
             int outputBuffer = 512;
-            
-            totalTokens = systemTokensCount + userTokensCount;
 
-            // If the total tokens + buffer exceed the laptop's set limit, sending back false will trigger a circuit breaker.
+            totalTokens = (int)Math.Ceiling(rawEstimate * CalibrationFactor);
+
             return (totalTokens + outputBuffer) <= maxContextWindow;
         }
     }

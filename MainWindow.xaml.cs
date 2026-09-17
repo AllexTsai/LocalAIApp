@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using LocalAIApp.Services;
@@ -24,7 +25,6 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         TxtResponse.Text = "地端 AI 原生防禦版就緒！";
-
         this.Closed += MainWindow_Closed;
     }
 
@@ -41,20 +41,27 @@ public partial class MainWindow : Window
         }
     }
 
-    System.Diagnostics.Stopwatch totalWatch = System.Diagnostics.Stopwatch.StartNew();
+    System.Diagnostics.Stopwatch totalWatch = new System.Diagnostics.Stopwatch();
     System.Diagnostics.Stopwatch tokenWatch = new System.Diagnostics.Stopwatch();
-
     long ttftMilliseconds = 0;
     int tokenCount = 0;
+
+    private class StreamAttemptResult
+    {
+        public bool CompletedNormally;   // 有收到 done:true
+        public bool WmiTriggered;        // 觸發了 WMI 協議分支
+        public int TokenCount;
+        public int ActualPromptEvalCount;
+        public string AccumulatedText = "";
+    }
+
     private async System.Threading.Tasks.Task SendMessageToAiAsync()
     {
         string userInput = TxtInput.Text.Trim();
         if (string.IsNullOrEmpty(userInput)) return;
 
-        // Clean Prompt
         string sanitizedInput = _securityPipeline.SanitizePrompt(userInput);
 
-        // By employing strict intent separation and strong paradigms, the reflection range of the small model is confined.
         string systemSetting =
             "你是一位精通 Windows 系統與顯示器色彩校正的專業架構師。請用繁體中文回答。\n\n" +
             "[核心規則]\n" +
@@ -73,8 +80,7 @@ public partial class MainWindow : Window
 
         const int LaptopMaxCtx = 2048;
 
-        // Token computing power circuit breaker check
-        if (!_securityPipeline.ValidateTokenBudget(systemSetting, sanitizedInput, LaptopMaxCtx, out int projectedTokens))
+        if (!_securityPipeline.ValidateTokenBudget(finalPrompt, LaptopMaxCtx, out int projectedTokens))
         {
             TxtResponse.Text = $"⚠️【地端算力防禦熔斷】\n當前輸入預估消耗 {projectedTokens} Tokens（已超越硬體負載上限 {LaptopMaxCtx}）。本次推理已安全攔截。";
             return;
@@ -82,70 +88,172 @@ public partial class MainWindow : Window
 
         _cts?.Cancel();
         _cts = new CancellationTokenSource();
+        var myToken = _cts.Token; // 鎖定這次呼叫專屬的 token，避免被下一次呼叫中途替換
 
         TxtInput.Clear();
         BtnSend.IsEnabled = false;
         TxtResponse.Text = "";
         LoadingOverlay.Visibility = Visibility.Visible;
 
+        totalWatch.Restart();
+        tokenWatch.Reset();
+        ttftMilliseconds = 0;
+        tokenCount = 0;
+
+        try
+        {
+            var attempt = await StreamOnceAsync(finalPrompt, sanitizedInput, temperature: 0.0, myToken);
+
+            // 串流異常中斷（沒收到 done:true，也沒有正常觸發 WMI 分支）才重試；
+            // temperature=0.0 是貪婪解碼，原地重試同一個 prompt 只會得到一模一樣的失敗結果，
+            // 所以重試時刻意調高 temperature，讓模型有機會走上不同的生成路徑。
+            if (!attempt.CompletedNormally && !attempt.WmiTriggered)
+            {
+                WriteStreamDebugLog($"STREAM_ABNORMAL_END | tokenCount={attempt.TokenCount} | retrying_with_temperature=0.7");
+                TxtResponse.Text += "\n\n⚠️ 偵測到回應異常中斷，正在以備用取樣參數重新嘗試...\n";
+                TxtResponse.ScrollToEnd();
+
+                totalWatch.Restart();
+                tokenWatch.Reset();
+                ttftMilliseconds = 0;
+
+                attempt = await StreamOnceAsync(finalPrompt, sanitizedInput, temperature: 0.7, myToken);
+
+                if (!attempt.CompletedNormally && !attempt.WmiTriggered)
+                {
+                    WriteStreamDebugLog($"GIVE_UP_AFTER_RETRY | tokenCount={attempt.TokenCount}");
+                    TxtResponse.Text = attempt.AccumulatedText +
+                        "\n\n⚠️ 此問題可能觸發已知的模型輸出編碼邊界情況，建議嘗試換句話問。";
+                    TxtResponse.ScrollToEnd();
+                }
+            }
+
+            tokenCount = attempt.TokenCount;
+
+            if (!attempt.WmiTriggered && tokenCount > 0)
+            {
+                tokenWatch.Stop();
+                double tpotMilliseconds = (double)tokenWatch.ElapsedMilliseconds / tokenCount;
+
+                Console.WriteLine($"[AI 效能報告] TTFT: {ttftMilliseconds} ms | TPOT: {tpotMilliseconds:F2} ms/token | 總生成 Token 數: {tokenCount} | 估算(校正後): {projectedTokens} | Ollama實際: {(attempt.ActualPromptEvalCount > 0 ? attempt.ActualPromptEvalCount.ToString() : "N/A")}");
+
+                TxtResponse.Text += $"\n\n" +
+                                    $"====================================\n" +
+                                    $"📊 【地端 AI 邊緣端效能即時觀測】\n" +
+                                    $"------------------------------------\n" +
+                                    $" ⏱️ 首字延遲 (TTFT)  : {ttftMilliseconds} ms\n" +
+                                    $" ⚡ 每個 Token 延遲   : {tpotMilliseconds:F2} ms/token\n" +
+                                    $" 📈 持續吞吐效能     : {(1000 / tpotMilliseconds):F1} tokens/sec\n" +
+                                    $" 📥 總輸出 Token 數量 : {tokenCount} tokens\n" +
+                                    $" 🎯 Token 估算校正值 : {projectedTokens}（校正係數 1.22）\n" +
+                                    $" ✅ Ollama 實際消耗  : {(attempt.ActualPromptEvalCount > 0 ? attempt.ActualPromptEvalCount.ToString() : "N/A")}\n" +
+                                    $"====================================";
+
+                TxtResponse.ScrollToEnd();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine("AI 推論已被使用者或系統安全取消。");
+            WriteStreamDebugLog($"CANCELLED | tokenCount={tokenCount}");
+        }
+        catch (Exception ex)
+        {
+            TxtResponse.Text = $"地端驅動發生錯誤: {ex.Message}";
+            WriteStreamDebugLog($"EXCEPTION: {ex.Message} | tokenCount={tokenCount}");
+        }
+        finally
+        {
+            LoadingOverlay.Visibility = Visibility.Collapsed;
+            BtnSend.IsEnabled = true;
+        }
+    }
+
+    private async Task<StreamAttemptResult> StreamOnceAsync(string finalPrompt, string sanitizedInput, double temperature, CancellationToken outerToken)
+    {
+        var result = new StreamAttemptResult();
         bool isFirstToken = true;
+        bool isProtocolChecked = false;
+        string fullResponseText = "";
 
         var requestPayload = new
         {
             model = "phi3",
             prompt = finalPrompt,
             stream = true,
-            options = new { num_predict = 512, temperature = 0.0, num_ctx = LaptopMaxCtx }
+            options = new { num_predict = 512, temperature = temperature, num_ctx = 2048, repeat_penalty = 1.1 }
         };
 
-        try
+        var jsonPayload = JsonSerializer.Serialize(requestPayload);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, OllamaUrl)
         {
-            var jsonPayload = JsonSerializer.Serialize(requestPayload);
+            Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
+        };
 
-            using var request = new HttpRequestMessage(HttpMethod.Post, OllamaUrl)
+        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, outerToken);
+        response.EnsureSuccessStatusCode();
+
+        using var stream = await response.Content.ReadAsStreamAsync(outerToken);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        while (true)
+        {
+            // 每一行都各自套用一個 8 秒的讀取逾時，跟外層的取消 token 合併；
+            // 逾時只代表「這一行等太久」，不等於使用者主動取消。
+            using var readTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(outerToken, readTimeoutCts.Token);
+
+            string? line;
+            try
             {
-                Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
-            };
-
-            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, _cts.Token);
-            response.EnsureSuccessStatusCode();
-
-            using var stream = await response.Content.ReadAsStreamAsync(_cts.Token);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-
-            string fullResponseText = "";
-            bool isProtocolChecked = false;
-
-            while (await reader.ReadLineAsync(_cts.Token) is string line)
+                line = await reader.ReadLineAsync(linkedCts.Token);
+            }
+            catch (OperationCanceledException) when (!outerToken.IsCancellationRequested)
             {
-                if (string.IsNullOrEmpty(line)) continue;
+                WriteStreamDebugLog($"READ_TIMEOUT_NO_DONE | tokenCount={result.TokenCount}");
+                break;
+            }
 
-                using var jsonDoc = JsonDocument.Parse(line);
-                var root = jsonDoc.RootElement;
+            if (line == null) break; // 串流結束（reader 收到 EOF）
+            if (string.IsNullOrEmpty(line)) continue;
 
-                if (root.TryGetProperty("response", out var responseProp))
+            using var jsonDoc = TryParseStreamLine(line);
+            if (jsonDoc == null) continue;
+            var root = jsonDoc.RootElement;
+
+            if (root.TryGetProperty("prompt_eval_count", out var promptEvalCountProp))
+            {
+                result.ActualPromptEvalCount = promptEvalCountProp.GetInt32();
+            }
+
+            if (root.TryGetProperty("done", out var doneProp) && doneProp.ValueKind == JsonValueKind.True)
+            {
+                WriteStreamDebugLog($"DONE_TRUE_LINE | raw_line=\"{line}\"");
+                result.CompletedNormally = true;
+            }
+
+            if (root.TryGetProperty("response", out var responseProp))
+            {
+                string token = responseProp.GetString() ?? "";
+
+                if (!string.IsNullOrEmpty(token))
                 {
-                    string token = responseProp.GetString() ?? "";
-                    if (isFirstToken && !string.IsNullOrEmpty(token))
+                    if (isFirstToken)
                     {
                         isFirstToken = false;
                         LoadingOverlay.Visibility = Visibility.Collapsed;
-
-                        // Stop counting when the first character is captured.
                         totalWatch.Stop();
                         ttftMilliseconds = totalWatch.ElapsedMilliseconds;
-
-                        // Start the word timer
                         tokenWatch.Start();
                     }
 
-                    tokenCount++;
+                    result.TokenCount++;
                     fullResponseText += token;
 
-                    // As long as the protocol hasn't been triggered yet, and the stream text contains a complete protocol closing tag. `]]`
                     if (!isProtocolChecked && fullResponseText.Contains("[[CALL_WMI:") && fullResponseText.Contains("]]"))
                     {
-                        isProtocolChecked = true; // The system is locked; subsequent normal conversations will never trigger the check again.
+                        isProtocolChecked = true;
                         LoadingOverlay.Visibility = Visibility.Collapsed;
 
                         int startIdx = fullResponseText.IndexOf("[[CALL_WMI:") + 11;
@@ -154,6 +262,18 @@ public partial class MainWindow : Window
                         if (endIdx > startIdx)
                         {
                             string selectedCategory = fullResponseText.Substring(startIdx, endIdx - startIdx).Trim();
+
+                            try
+                            {
+                                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wmi_trigger_debug.log");
+                                string logEntry = $"時間戳: {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}\n" +
+                                                   $"使用者原始輸入 (sanitizedInput): {sanitizedInput}\n" +
+                                                   $"解析出的 selectedCategory: {selectedCategory}\n" +
+                                                   $"觸發當下的完整 fullResponseText:\n{fullResponseText}\n" +
+                                                   $"------------------------------------\n";
+                                File.AppendAllText(logPath, logEntry);
+                            }
+                            catch { }
 
                             TxtResponse.Text = $"🤖 [協議解碼成功] 偵測到模型發射 WMI 驅動標籤：[{selectedCategory}]。\n正在跨進程喚醒 WmiQueryTool 子系統...\n";
                             TxtResponse.ScrollToEnd();
@@ -169,11 +289,13 @@ public partial class MainWindow : Window
                                 TxtResponse.Text += $"\n====================================\n{wmiResult}====================================\n\n🤖 [系統優化提示] 舊有組件數據已透過 IPC 隔離管道安全回填。";
                                 TxtResponse.ScrollToEnd();
                             }
-                            break; // The Ollama connection should only be disconnected when the WMI protocol is actually triggered!
+
+                            result.WmiTriggered = true;
+                            result.AccumulatedText = fullResponseText;
+                            return result;
                         }
                     }
 
-                    // As long as it doesn't start with a protocol tag, it's a pure technical discussion, 100% complete, and will never be interrupted midway.
                     if (!fullResponseText.StartsWith("[[CALL_WMI:"))
                     {
                         TxtResponse.Text = fullResponseText;
@@ -181,54 +303,47 @@ public partial class MainWindow : Window
                     }
                 }
             }
-
-            // After the streaming is completely finished (outside the loop), calculate TPOT and output the performance metrics to the UI or Console.
-            tokenWatch.Stop();
-            double tpotMilliseconds = tokenCount > 0 ? (double)tokenWatch.ElapsedMilliseconds / tokenCount : 0;
-
-            Console.WriteLine($"[AI 效能報告] TTFT (首字延遲): {ttftMilliseconds} ms | TPOT (平均字延遲): {tpotMilliseconds:F2} ms/token | 總生成 Token 數: {tokenCount}");
-
-            if (tokenCount > 0)
-            {
-                TxtResponse.Text += $"\n\n" +
-                                    $"====================================\n" +
-                                    $"📊 【地端 AI 邊緣端效能即時觀測】\n" +
-                                    $"------------------------------------\n" +
-                                    $" ⏱️ 首字延遲 (TTFT)  : {ttftMilliseconds} ms\n" +
-                                    $" ⚡ 每個 Token 延遲   : {tpotMilliseconds:F2} ms/token\n" +
-                                    $" 📈 持續吞吐效能     : {(1000 / tpotMilliseconds):F1} tokens/sec\n" +
-                                    $" 📥 總輸出 Token 數量 : {tokenCount} tokens\n" +
-                                    $"====================================";
-                
-                TxtResponse.ScrollToEnd();
-            }
         }
-        catch (OperationCanceledException)
+
+        result.AccumulatedText = fullResponseText;
+        WriteStreamDebugLog(result.CompletedNormally
+            ? $"NORMAL_LOOP_END | tokenCount={result.TokenCount}"
+            : $"NORMAL_LOOP_END_WITHOUT_DONE | tokenCount={result.TokenCount}");
+
+        return result;
+    }
+
+    private static JsonDocument? TryParseStreamLine(string line)
+    {
+        try
         {
-            System.Diagnostics.Debug.WriteLine("AI 推論已被使用者或系統安全取消。");
+            return JsonDocument.Parse(line);
         }
         catch (Exception ex)
         {
-            TxtResponse.Text = $"地端驅動發生錯誤: {ex.Message}";
-        }
-        finally
-        {
-            LoadingOverlay.Visibility = Visibility.Collapsed;
-            BtnSend.IsEnabled = true;
+            WriteStreamDebugLog($"JSON_PARSE_FAILED | raw_line=\"{line}\" | exception={ex.Message}");
+            return null;
         }
     }
 
+    private static void WriteStreamDebugLog(string message)
+    {
+        try
+        {
+            string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "stream_parse_debug.log");
+            File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}\n");
+        }
+        catch
+        {
+            // debug log 寫入失敗不應該影響主流程
+        }
+    }
 
     private void MainWindow_Closed(object? sender, EventArgs e)
     {
-        // 1. Send a cancellation signal to forcibly interrupt the HttpClient stream that is running in the background.
         _cts?.Cancel();
         _cts?.Dispose();
-
-        // 2. Completely release HttpClient
         _httpClient.Dispose();
-
-        // 3. Forcefully ensures the entire WPF process exits completely.
         Application.Current.Shutdown();
     }
 }
