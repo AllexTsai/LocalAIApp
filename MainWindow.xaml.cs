@@ -3,6 +3,7 @@ using System.IO;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -20,12 +21,21 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _cts;
 
     private readonly IAiSecurityPipeline _securityPipeline = new AiSecurityPipeline();
+    private readonly IToolDiscoveryService _toolDiscoveryService = new ToolDiscoveryService();
+    private readonly string _toolListText;
+
+    private static readonly Regex ProtocolTagPattern =
+        new Regex(@"\[\[([A-Z_]+):([^\]]*)\]\]", RegexOptions.Compiled);
 
     public MainWindow()
     {
         InitializeComponent();
         TxtResponse.Text = "地端 AI 原生防禦版就緒！";
         this.Closed += MainWindow_Closed;
+
+        // 掃描所有標記 [AiPlugin] 的方法，動態組出可用工具清單，取代手寫的固定規則列表。
+        var discoveredTools = _toolDiscoveryService.DiscoverTools(typeof(WmiToolAdapter));
+        _toolListText = _toolDiscoveryService.BuildToolListText(discoveredTools);
     }
 
     private async void BtnSend_Click(object sender, RoutedEventArgs e)
@@ -48,8 +58,10 @@ public partial class MainWindow : Window
 
     private class StreamAttemptResult
     {
-        public bool CompletedNormally;   // 有收到 done:true
-        public bool WmiTriggered;        // 觸發了 WMI 協議分支
+        public bool CompletedNormally;        // 有收到 done:true
+        public bool WmiTriggered;             // 觸發了 WMI 協議分支
+        public bool ContentLeakageDetected;   // 偵測到模型複誦/幻覺系統指令結構，已提早中止
+        public bool UnknownProtocolDetected;  // 偵測到未定義的協議標籤（非 CALL_WMI），已提早中止
         public int TokenCount;
         public int ActualPromptEvalCount;
         public string AccumulatedText = "";
@@ -67,11 +79,7 @@ public partial class MainWindow : Window
             "[核心規則]\n" +
             "1. 當使用者是在跟你「討論技術概念」、「比較平台差異」(例如問Windows與Mac色彩差異) 或「一般聊天」時，你「禁止」輸出任何協議標籤，請直接用文字專業回覆。\n" +
             "2. 只有當使用者發出明確的「查詢指令」或希望「即時偵測/診斷/獲取當前這台電腦的實體硬體數據」時，你才可以在回覆的最開頭輸出以下標籤（其後不加其他文字）：\n" +
-            "   - 明確要求查這台電腦的作業系統版本: [[CALL_WMI:OS]]\n" +
-            "   - 明確要求查這台電腦的CPU資訊/負載: [[CALL_WMI:CPU]]\n" +
-            "   - 明確要求查這台電腦的顯示卡/GPU: [[CALL_WMI:GPU]]\n" +
-            "   - 明確要求查這台電腦的記憶體/RAM: [[CALL_WMI:Memory]]\n" +
-            "   - 明確要求查這台電腦的硬碟/Disk: [[CALL_WMI:Disk]]\n\n" +
+            _toolListText + "\n\n" +
             "[範例對齊]\n" +
             "問：「Windows色彩架構跟Mac有何不同？」 -> 答：「(直接詳細解釋ICC Profile與色彩管理差異，絕對不帶有標籤)」\n" +
             "問：「幫我看一下我這台電腦的CPU是哪一顆」 -> 答：「[[CALL_WMI:CPU]]」";
@@ -107,7 +115,7 @@ public partial class MainWindow : Window
             // 串流異常中斷（沒收到 done:true，也沒有正常觸發 WMI 分支）才重試；
             // temperature=0.0 是貪婪解碼，原地重試同一個 prompt 只會得到一模一樣的失敗結果，
             // 所以重試時刻意調高 temperature，讓模型有機會走上不同的生成路徑。
-            if (!attempt.CompletedNormally && !attempt.WmiTriggered)
+            if (!attempt.CompletedNormally && !attempt.WmiTriggered && !attempt.ContentLeakageDetected && !attempt.UnknownProtocolDetected)
             {
                 WriteStreamDebugLog($"STREAM_ABNORMAL_END | tokenCount={attempt.TokenCount} | retrying_with_temperature=0.7");
                 TxtResponse.Text += "\n\n⚠️ 偵測到回應異常中斷，正在以備用取樣參數重新嘗試...\n";
@@ -119,7 +127,7 @@ public partial class MainWindow : Window
 
                 attempt = await StreamOnceAsync(finalPrompt, sanitizedInput, temperature: 0.7, myToken);
 
-                if (!attempt.CompletedNormally && !attempt.WmiTriggered)
+                if (!attempt.CompletedNormally && !attempt.WmiTriggered && !attempt.ContentLeakageDetected && !attempt.UnknownProtocolDetected)
                 {
                     WriteStreamDebugLog($"GIVE_UP_AFTER_RETRY | tokenCount={attempt.TokenCount}");
                     TxtResponse.Text = attempt.AccumulatedText +
@@ -130,7 +138,7 @@ public partial class MainWindow : Window
 
             tokenCount = attempt.TokenCount;
 
-            if (!attempt.WmiTriggered && tokenCount > 0)
+            if (!attempt.WmiTriggered && !attempt.ContentLeakageDetected && !attempt.UnknownProtocolDetected && tokenCount > 0)
             {
                 tokenWatch.Stop();
                 double tpotMilliseconds = (double)tokenWatch.ElapsedMilliseconds / tokenCount;
@@ -251,48 +259,87 @@ public partial class MainWindow : Window
                     result.TokenCount++;
                     fullResponseText += token;
 
-                    if (!isProtocolChecked && fullResponseText.Contains("[[CALL_WMI:") && fullResponseText.Contains("]]"))
+                    // 內容健檢：模型若複誦/幻覺出系統指令本身的結構（而非真的在回答問題），立刻中止本次串流。
+                    if (fullResponseText.Contains("[核心規則]") || fullResponseText.Contains("[範例對齊]"))
                     {
-                        isProtocolChecked = true;
-                        LoadingOverlay.Visibility = Visibility.Collapsed;
+                        string matchedMarker = fullResponseText.Contains("[核心規則]") ? "[核心規則]" : "[範例對齊]";
+                        string snippet = fullResponseText.Length > 200 ? fullResponseText.Substring(0, 200) : fullResponseText;
+                        WriteStreamDebugLog($"SYSTEM_PROMPT_LEAKAGE_DETECTED | matched_marker={matchedMarker} | raw_response_snippet={snippet}");
 
-                        int startIdx = fullResponseText.IndexOf("[[CALL_WMI:") + 11;
-                        int endIdx = fullResponseText.IndexOf("]]", startIdx);
+                        TxtResponse.Text = "⚠️ [內容異常攔截] 偵測到模型輸出疑似偏離主題，已中止本次回應，建議換句話問或提供更明確的指令。";
+                        TxtResponse.ScrollToEnd();
 
-                        if (endIdx > startIdx)
+                        result.ContentLeakageDetected = true;
+                        result.AccumulatedText = fullResponseText;
+                        return result;
+                    }
+
+                    if (!isProtocolChecked)
+                    {
+                        var protocolMatch = ProtocolTagPattern.Match(fullResponseText);
+
+                        if (protocolMatch.Success)
                         {
-                            string selectedCategory = fullResponseText.Substring(startIdx, endIdx - startIdx).Trim();
+                            isProtocolChecked = true;
+                            string tagName = protocolMatch.Groups[1].Value;
+                            string tagParam = protocolMatch.Groups[2].Value;
 
-                            try
+                            if (tagName != "CALL_WMI")
                             {
-                                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wmi_trigger_debug.log");
-                                string logEntry = $"時間戳: {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}\n" +
-                                                   $"使用者原始輸入 (sanitizedInput): {sanitizedInput}\n" +
-                                                   $"解析出的 selectedCategory: {selectedCategory}\n" +
-                                                   $"觸發當下的完整 fullResponseText:\n{fullResponseText}\n" +
-                                                   $"------------------------------------\n";
-                                File.AppendAllText(logPath, logEntry);
-                            }
-                            catch { }
+                                // 幻覺協議標籤：不是我們定義的 CALL_WMI，不嘗試呼叫任何工具，直接安全攔截。
+                                LoadingOverlay.Visibility = Visibility.Collapsed;
 
-                            TxtResponse.Text = $"🤖 [協議解碼成功] 偵測到模型發射 WMI 驅動標籤：[{selectedCategory}]。\n正在跨進程喚醒 WmiQueryTool 子系統...\n";
-                            TxtResponse.ScrollToEnd();
+                                string snippet = fullResponseText.Length > 200 ? fullResponseText.Substring(0, 200) : fullResponseText;
+                                WriteStreamDebugLog($"UNKNOWN_PROTOCOL_TAG | tag_name={tagName} | tag_param={tagParam} | raw_snippet={snippet}");
 
-                            var adapterType = typeof(WmiToolAdapter);
-                            var method = adapterType.GetMethod("ExecuteWmiQuery");
-
-                            if (method != null)
-                            {
-                                var adapterInstance = new WmiToolAdapter();
-                                string wmiResult = (string)method.Invoke(adapterInstance, new object[] { selectedCategory })!;
-
-                                TxtResponse.Text += $"\n====================================\n{wmiResult}====================================\n\n🤖 [系統優化提示] 舊有組件數據已透過 IPC 隔離管道安全回填。";
+                                TxtResponse.Text = $"⚠️ [未知協議攔截] 偵測到模型輸出未定義的協議格式 [{tagName}:{tagParam}]，已安全攔截。";
                                 TxtResponse.ScrollToEnd();
+
+                                result.UnknownProtocolDetected = true;
+                                result.AccumulatedText = fullResponseText;
+                                return result;
                             }
 
-                            result.WmiTriggered = true;
-                            result.AccumulatedText = fullResponseText;
-                            return result;
+                            LoadingOverlay.Visibility = Visibility.Collapsed;
+
+                            int startIdx = fullResponseText.IndexOf("[[CALL_WMI:") + 11;
+                            int endIdx = fullResponseText.IndexOf("]]", startIdx);
+
+                            if (endIdx > startIdx)
+                            {
+                                string selectedCategory = fullResponseText.Substring(startIdx, endIdx - startIdx).Trim();
+
+                                try
+                                {
+                                    string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wmi_trigger_debug.log");
+                                    string logEntry = $"時間戳: {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}\n" +
+                                                       $"使用者原始輸入 (sanitizedInput): {sanitizedInput}\n" +
+                                                       $"解析出的 selectedCategory: {selectedCategory}\n" +
+                                                       $"觸發當下的完整 fullResponseText:\n{fullResponseText}\n" +
+                                                       $"------------------------------------\n";
+                                    File.AppendAllText(logPath, logEntry);
+                                }
+                                catch { }
+
+                                TxtResponse.Text = $"🤖 [協議解碼成功] 偵測到模型發射 WMI 驅動標籤：[{selectedCategory}]。\n正在跨進程喚醒 WmiQueryTool 子系統...\n";
+                                TxtResponse.ScrollToEnd();
+
+                                var adapterType = typeof(WmiToolAdapter);
+                                var method = adapterType.GetMethod("ExecuteWmiQuery");
+
+                                if (method != null)
+                                {
+                                    var adapterInstance = new WmiToolAdapter();
+                                    string wmiResult = (string)method.Invoke(adapterInstance, new object[] { selectedCategory })!;
+
+                                    TxtResponse.Text += $"\n====================================\n{wmiResult}====================================\n\n🤖 [系統優化提示] 舊有組件數據已透過 IPC 隔離管道安全回填。";
+                                    TxtResponse.ScrollToEnd();
+                                }
+
+                                result.WmiTriggered = true;
+                                result.AccumulatedText = fullResponseText;
+                                return result;
+                            }
                         }
                     }
 

@@ -8,7 +8,9 @@ namespace LocalAIApp.Tools;
 public class WmiToolAdapter
 {
     // The instruction manual tells the AI ​​that you can pass in five parameters: "OS", "CPU", "GPU", "Memory", and "Disk".
-    [AiPlugin("ExecuteWmiQuery", "當使用者需要查詢特定的硬體資訊時呼叫此工具。必須傳入 wmiCategory 參數：'OS'、'CPU'、'GPU'、'Memory' 或 'Disk'。")]
+    [AiPlugin("ExecuteWmiQuery", "當使用者明確要求查詢這台電腦的實體硬體資訊時呼叫此工具。",
+        TagTemplate = "[[CALL_WMI:{0}]]",
+        ValidValues = new[] { "OS", "CPU", "GPU", "Memory", "Disk" })]
     public string ExecuteWmiQuery(string wmiCategory)
     {
         // Define the path to the pre-compiled WmiQueryTool.exe.
