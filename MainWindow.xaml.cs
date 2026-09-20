@@ -1,6 +1,8 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -22,6 +24,7 @@ public partial class MainWindow : Window
 
     private readonly IAiSecurityPipeline _securityPipeline = new AiSecurityPipeline();
     private readonly IToolDiscoveryService _toolDiscoveryService = new ToolDiscoveryService();
+    private readonly IReadOnlyList<ToolInfo> _discoveredTools;
     private readonly string _toolListText;
 
     private static readonly Regex ProtocolTagPattern =
@@ -34,8 +37,15 @@ public partial class MainWindow : Window
         this.Closed += MainWindow_Closed;
 
         // 掃描所有標記 [AiPlugin] 的方法，動態組出可用工具清單，取代手寫的固定規則列表。
-        var discoveredTools = _toolDiscoveryService.DiscoverTools(typeof(WmiToolAdapter));
-        _toolListText = _toolDiscoveryService.BuildToolListText(discoveredTools);
+        _discoveredTools = _toolDiscoveryService.DiscoverTools(typeof(WmiToolAdapter));
+        _toolListText = _toolDiscoveryService.BuildToolListText(_discoveredTools);
+    }
+
+    private bool IsValidWmiCategory(string selectedCategory)
+    {
+        var wmiToolInfo = _discoveredTools.FirstOrDefault(t => t.MethodName == "ExecuteWmiQuery");
+        return wmiToolInfo?.ValidValues != null &&
+            wmiToolInfo.ValidValues.Contains(selectedCategory, StringComparer.OrdinalIgnoreCase);
     }
 
     private async void BtnSend_Click(object sender, RoutedEventArgs e)
@@ -62,9 +72,14 @@ public partial class MainWindow : Window
         public bool WmiTriggered;             // 觸發了 WMI 協議分支
         public bool ContentLeakageDetected;   // 偵測到模型複誦/幻覺系統指令結構，已提早中止
         public bool UnknownProtocolDetected;  // 偵測到未定義的協議標籤（非 CALL_WMI），已提早中止
+        public bool InvalidCategoryDetected;  // CALL_WMI 帶了不在白名單內的分類，已提早中止
         public int TokenCount;
         public int ActualPromptEvalCount;
         public string AccumulatedText = "";
+
+        // 這次串流是否以某種「已安全處理完畢」的方式結束（觸發工具、或被安全攔截），
+        // 這些情況都不該再被當成異常中斷去重試，也不該再疊加效能報告。
+        public bool WasIntercepted => WmiTriggered || ContentLeakageDetected || UnknownProtocolDetected || InvalidCategoryDetected;
     }
 
     private async System.Threading.Tasks.Task SendMessageToAiAsync()
@@ -115,7 +130,7 @@ public partial class MainWindow : Window
             // 串流異常中斷（沒收到 done:true，也沒有正常觸發 WMI 分支）才重試；
             // temperature=0.0 是貪婪解碼，原地重試同一個 prompt 只會得到一模一樣的失敗結果，
             // 所以重試時刻意調高 temperature，讓模型有機會走上不同的生成路徑。
-            if (!attempt.CompletedNormally && !attempt.WmiTriggered && !attempt.ContentLeakageDetected && !attempt.UnknownProtocolDetected)
+            if (!attempt.CompletedNormally && !attempt.WasIntercepted)
             {
                 WriteStreamDebugLog($"STREAM_ABNORMAL_END | tokenCount={attempt.TokenCount} | retrying_with_temperature=0.7");
                 TxtResponse.Text += "\n\n⚠️ 偵測到回應異常中斷，正在以備用取樣參數重新嘗試...\n";
@@ -127,7 +142,7 @@ public partial class MainWindow : Window
 
                 attempt = await StreamOnceAsync(finalPrompt, sanitizedInput, temperature: 0.7, myToken);
 
-                if (!attempt.CompletedNormally && !attempt.WmiTriggered && !attempt.ContentLeakageDetected && !attempt.UnknownProtocolDetected)
+                if (!attempt.CompletedNormally && !attempt.WasIntercepted)
                 {
                     WriteStreamDebugLog($"GIVE_UP_AFTER_RETRY | tokenCount={attempt.TokenCount}");
                     TxtResponse.Text = attempt.AccumulatedText +
@@ -138,7 +153,7 @@ public partial class MainWindow : Window
 
             tokenCount = attempt.TokenCount;
 
-            if (!attempt.WmiTriggered && !attempt.ContentLeakageDetected && !attempt.UnknownProtocolDetected && tokenCount > 0)
+            if (!attempt.WasIntercepted && tokenCount > 0)
             {
                 tokenWatch.Stop();
                 double tpotMilliseconds = (double)tokenWatch.ElapsedMilliseconds / tokenCount;
@@ -308,6 +323,20 @@ public partial class MainWindow : Window
                             if (endIdx > startIdx)
                             {
                                 string selectedCategory = fullResponseText.Substring(startIdx, endIdx - startIdx).Trim();
+
+                                if (!IsValidWmiCategory(selectedCategory))
+                                {
+                                    var wmiToolInfoForLog = _discoveredTools.FirstOrDefault(t => t.MethodName == "ExecuteWmiQuery");
+                                    string validValuesText = wmiToolInfoForLog?.ValidValues != null ? string.Join(",", wmiToolInfoForLog.ValidValues) : "";
+                                    WriteStreamDebugLog($"INVALID_WMI_CATEGORY | selected_category={selectedCategory} | valid_values={validValuesText}");
+
+                                    TxtResponse.Text = $"⚠️ [分類驗證失敗] 模型輸出了無法識別的分類「{selectedCategory}」，已安全攔截，未執行任何硬體查詢。";
+                                    TxtResponse.ScrollToEnd();
+
+                                    result.InvalidCategoryDetected = true;
+                                    result.AccumulatedText = fullResponseText;
+                                    return result;
+                                }
 
                                 try
                                 {
