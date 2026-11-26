@@ -8,15 +8,15 @@ The design focuses on staying within a laptop's compute and memory limits: a pre
 
 ## 🚀 Technical Highlights
 
-This application addresses several practical problems of Edge AI desktop clients (e.g., high Time-to-First-Token latency, stream truncation, and unreliable model output):
+This application addresses several practical problems of Edge AI desktop clients (memory limits, stream truncation, and unreliable model output):
 
-### 1. Time-to-First-Token (TTFT) Latency Tuning (`num_ctx` Optimization)
-*   **The Pitfall**: Running localized SLMs on consumer hardware (such as laptops) with bloated default context windows drastically increases memory footprints and computational overhead, leading to sluggish initial token rendering and poor user experience.
+### 1. Bounded Context Window (`num_ctx = 2048`)
+*   **The Pitfall**: On consumer hardware such as laptops, a larger context window uses more memory, and this client only sends short queries.
 *   **The Solution**: Explicitly injected core parameters into the inference request body by setting `num_ctx = 2048`. This keeps the context window small for the short domain queries this client handles. TTFT with and without this setting was not compared.
 
-### 2. Defensive Text Generation & Truncation Control (`num_predict`)
-*   **The Pitfall**: Localized SLMs operating without discrete GPU acceleration or under heavy context pressure are prone to token hallucination, infinite loop rendering, or encoding corruption, which eventually triggers network socket timeout exceptions.
-*   **The Solution**: The primary request uses `temperature = 0.0` (greedy decoding), so the same prompt is expected to produce the same output (observed on repeated runs of one short prompt). If a stream ends abnormally — no completion signal received, and none of the known abort branches were triggered (see Section 8 below) — the request is automatically retried once with `temperature = 0.7`. Because greedy decoding is deterministic, retrying at the same temperature would only reproduce the exact same failure; introducing randomness gives the model a chance to follow a different generation path and avoid the token sequence that triggered the original failure.
+### 2. Deterministic Primary Request and One Retry (`temperature`)
+*   **The Pitfall**: A stream from a small model running on a laptop can end abnormally (observed once: a silent mid-stream truncation, see Section 8).
+*   **The Solution**: The primary request uses `temperature = 0.0` (greedy decoding), so the same prompt is expected to produce the same output (observed on repeated runs of one short prompt). If a stream ends abnormally — no completion signal received, and none of the known abort branches were triggered (see Section 8 below) — the request is automatically retried once with `temperature = 0.7`. Because greedy decoding is deterministic, retrying at the same temperature would reproduce the same output, so the retry uses a different temperature. The retry success rate was not measured. The request also caps output with `num_predict = 512`.
 
 ### 3. Asynchronous Line-by-Line Streaming
 *   **The Solution**: Calls the Ollama HTTP API directly with `.NET 10 HttpClient` and `HttpCompletionOption.ResponseHeadersRead`, and reads the response line by line with `ReadLineAsync` so tokens appear as they arrive. The underlying stream can still fail for reasons outside the client's control (see Section 8), which the retry and defense layers below are designed to catch.
@@ -25,12 +25,13 @@ This application addresses several practical problems of Edge AI desktop clients
 *   **The Pitfall**: Abruptly terminating the UI window during an active AI text stream often disconnects the HTTP socket but may leave the in-flight inference request running on the server, which would keep consuming CPU/GPU until it finishes.
 *   **The Solution**: A `CancellationTokenSource` is bound directly into the WPF `Closed` lifecycle event. Closing the window immediately triggers cancellation, which closes the underlying HTTP stream and cancels the in-flight request from the client side. Whether the server stops generating promptly was not measured.
 
-### 5. Loading Indicator
+### 5. Loading Indicator and Response Statistics
 *   **The Solution**: While waiting for the first token, a WPF ProgressBar with `IsIndeterminate="True"` is shown; it is hidden as soon as the first streamed token arrives.
+*   **Statistics**: After a reply finishes normally, the UI appends time to first token (TTFT), time per output token (TPOT), tokens per second, the output token count, the corrected token estimate, and the prompt token count reported by Ollama.
 
 ### 6. Token Budget Calibration Against Empirical Ground Truth
-*   **The Pitfall**: The token-budget circuit breaker (`ValidateTokenBudget`) estimates prompt size by running SharpToken's `cl100k_base` encoding over the fully assembled `finalPrompt` (including chat-template tags). `cl100k_base` is not Phi-3's native tokenizer, so this estimate is only an approximation and can systematically diverge from what the model actually consumes.
-*   **The Solution**: Across 15 empirical samples (short prompts, long inputs, pure Chinese, pure English, and mixed Chinese/English), the ratio between Ollama's actual `prompt_eval_count` and the SharpToken estimate was measured to fall consistently between 1.1930 and 1.2140 (mean 1.2033, standard deviation 0.48%). A calibration factor of 1.22 — slightly above the observed maximum — is applied to the raw estimate before comparing it against the context budget, so the circuit breaker's safety margin is grounded in measured behavior rather than a theoretical token count.
+*   **The Pitfall**: The token-budget check (`ValidateTokenBudget`) estimates prompt size by running SharpToken's `cl100k_base` encoding over the fully assembled `finalPrompt` (including chat-template tags). `cl100k_base` is not Phi-3's native tokenizer, so this estimate is only an approximation and can systematically diverge from what the model actually consumes.
+*   **The Solution**: Across 15 empirical samples (short prompts, long inputs, pure Chinese, pure English, and mixed Chinese/English), the ratio between Ollama's actual `prompt_eval_count` and the SharpToken estimate was measured to fall consistently between 1.1930 and 1.2140 (mean 1.2033, standard deviation 0.48%). A calibration factor of 1.22 — slightly above the observed maximum — is applied to the raw estimate before comparing it against the context budget, so the budget check has a margin based on measured data. The 15 samples are from one model on one machine.
 
 ### 7. Dynamic Tool Discovery via Reflection-Based Plugin Attributes
 *   **The Pitfall**: The system prompt's list of callable tools (e.g., which hardware categories the model may query via WMI) was originally hand-written as fixed text, requiring a manual edit to `MainWindow.xaml.cs` every time a new tool or category was added.
@@ -80,3 +81,11 @@ dotnet restore
 # Run the desktop client
 dotnet run
 ```
+
+---
+
+## ⚠️ Limitations
+- Whether the server stops generating after the client cancels was not measured.
+- The retry success rate was not measured.
+- The 8-second read timeout has not been observed firing; the category whitelist was checked in isolation only.
+- The token calibration (1.22) comes from 15 samples with one model on one machine.
